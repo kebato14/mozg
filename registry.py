@@ -6,7 +6,8 @@ import sqlite3
 import os
 from datetime import datetime
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "registry.db")
+_data_dir = os.getenv("DATA_DIR", os.path.dirname(__file__))
+DB_PATH = os.path.join(_data_dir, "registry.db")
 
 
 def get_conn():

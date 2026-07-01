@@ -1,0 +1,32 @@
+services:
+  agent:
+    build: .
+    restart: unless-stopped
+    environment:
+      # ── Telegram ──────────────────────────────────────────
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
+
+      # ── YouGile ───────────────────────────────────────────
+      - YOUGILE_API_KEY=${YOUGILE_API_KEY}
+      - YOUGILE_COMPANY_ID=${YOUGILE_COMPANY_ID}
+
+      # ── Google Drive ──────────────────────────────────────
+      - GOOGLE_PROJECT_ID=${GOOGLE_PROJECT_ID}
+      - GOOGLE_DRIVE_FOLDER_ID=${GOOGLE_DRIVE_FOLDER_ID}
+      - GOOGLE_CREDENTIALS_FILE=/app/secrets/google_credentials.json
+      - DATA_DIR=/app/data
+
+    volumes:
+      # Постоянное хранилище: реестр документов
+      - registry-data:/app/data
+      # Секреты Google OAuth (монтируются вручную через Coolify)
+      - /data/coolify/services/mozg/secrets:/app/secrets:ro
+
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os; exit(0 if os.path.exists('/app/bot.py') else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  registry-data:
