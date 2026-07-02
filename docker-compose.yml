@@ -2,6 +2,8 @@ services:
   agent:
     build: .
     restart: unless-stopped
+    ports:
+      - "${SERVICE_PORT_8080:-8080}:8080"
     environment:
       # ── Telegram ──────────────────────────────────────────
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN}
@@ -14,19 +16,21 @@ services:
       - GOOGLE_PROJECT_ID=${GOOGLE_PROJECT_ID}
       - GOOGLE_DRIVE_FOLDER_ID=${GOOGLE_DRIVE_FOLDER_ID}
       - GOOGLE_CREDENTIALS_FILE=/app/secrets/google_credentials.json
+
+      # ── Данные и health check ─────────────────────────────
       - DATA_DIR=/app/data
+      - HEALTH_PORT=8080
 
     volumes:
-      # Постоянное хранилище: реестр документов
       - registry-data:/app/data
-      # Секреты Google OAuth (монтируются вручную через Coolify)
       - /data/coolify/services/mozg/secrets:/app/secrets:ro
 
     healthcheck:
-      test: ["CMD", "python3", "-c", "import os; exit(0 if os.path.exists('/app/bot.py') else 1)"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 15s
 
 volumes:
   registry-data:

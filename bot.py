@@ -7,7 +7,9 @@ import os
 import logging
 import re
 import tempfile
+import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -532,6 +534,35 @@ async def docs_recent_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_recent_docs(update.message)
 
 
+# ─── Health check сервер ─────────────────────────────────────────────────────
+
+_bot_healthy = False
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        stats = registry.get_stats()
+        if _bot_healthy:
+            body = f'{{"status":"ok","docs":{stats["total"]},"today":{stats["today"]}}}'.encode()
+            self.send_response(200)
+        else:
+            body = b'{"status":"starting"}'
+            self.send_response(503)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    port = int(os.getenv("HEALTH_PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"Health check: http://0.0.0.0:{port}/")
+    server.serve_forever()
+
+
 # ─── Запуск ──────────────────────────────────────────────────────────────────
 
 def main():
@@ -549,6 +580,11 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
+    # Запускаем health check в фоне
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    global _bot_healthy
+    _bot_healthy = True
     logger.info("🤖 Агент УЦЦП запущен")
     app.run_polling()
 
