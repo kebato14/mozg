@@ -17,13 +17,16 @@ services:
       - GOOGLE_DRIVE_FOLDER_ID=${GOOGLE_DRIVE_FOLDER_ID}
       - GOOGLE_CREDENTIALS_FILE=/app/secrets/google_credentials.json
 
+      # ── Секреты Google (base64) ───────────────────────────
+      - GOOGLE_CREDENTIALS_B64=${GOOGLE_CREDENTIALS_B64}
+      - GOOGLE_TOKEN_B64=${GOOGLE_TOKEN_B64}
+
       # ── Данные и health check ─────────────────────────────
       - DATA_DIR=/app/data
       - HEALTH_PORT=8080
 
     volumes:
       - registry-data:/app/data
-      - /data/coolify/services/mozg/secrets:/app/secrets:ro
 
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]

@@ -8,7 +8,11 @@ from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
-TOKEN_FILE = os.path.join(os.path.dirname(__file__), "token.json")
+TOKEN_FILE = os.getenv("GOOGLE_TOKEN_FILE", os.path.join(os.path.dirname(__file__), "token.json"))
+# В Docker secrets монтируются в /app/secrets/
+_secrets_token = "/app/secrets/token.json"
+if os.path.exists(_secrets_token):
+    TOKEN_FILE = _secrets_token
 FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 
