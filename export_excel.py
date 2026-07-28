@@ -31,7 +31,7 @@ def export_to_excel(output_path: str = None) -> str:
     COLOR_WHITE   = "FFFFFF"
 
     # ── Заголовок отчёта ──
-    ws.merge_cells("A1:G1")
+    ws.merge_cells("A1:H1")
     title_cell = ws["A1"]
     title_cell.value = "РЕЕСТР ДОКУМЕНТОВ — УЦЦП / Хрокой Душанбе"
     title_cell.font = Font(name="Calibri", bold=True, size=14, color=COLOR_WHITE)
@@ -39,7 +39,7 @@ def export_to_excel(output_path: str = None) -> str:
     title_cell.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 28
 
-    ws.merge_cells("A2:G2")
+    ws.merge_cells("A2:H2")
     sub = ws["A2"]
     sub.value = f"Дата выгрузки: {datetime.now().strftime('%d.%m.%Y %H:%M')}   |   Всего документов: {stats['total']}   |   Загружено сегодня: {stats['today']}"
     sub.font = Font(name="Calibri", italic=True, size=10, color="555555")
@@ -47,8 +47,8 @@ def export_to_excel(output_path: str = None) -> str:
     ws.row_dimensions[2].height = 18
 
     # ── Шапка таблицы ──
-    headers = ["№", "Номер документа", "Дата загрузки", "Кто загрузил", "Telegram", "Файл", "Ссылка"]
-    col_widths = [5, 22, 20, 25, 20, 35, 15]
+    headers = ["№", "Номер документа", "Дата загрузки", "Направление", "Кто загрузил", "Telegram", "Файл", "Ссылка"]
+    col_widths = [5, 22, 20, 22, 25, 20, 35, 15]
 
     for col_idx, (header, width) in enumerate(zip(headers, col_widths), start=1):
         cell = ws.cell(row=3, column=col_idx, value=header)
@@ -72,6 +72,7 @@ def export_to_excel(output_path: str = None) -> str:
             row_idx,
             doc["doc_number"],
             doc["uploaded_at"],
+            doc.get("category") or "—",
             doc["full_name"] or "—",
             f"@{doc['username']}" if doc.get("username") else "—",
             doc["filename"],
@@ -89,7 +90,7 @@ def export_to_excel(output_path: str = None) -> str:
             )
 
             # Ссылка — кликабельная
-            if col_idx == 7 and value and value.startswith("http"):
+            if col_idx == 8 and value and value.startswith("http"):
                 cell.value = "Открыть"
                 cell.hyperlink = value
                 cell.font = Font(name="Calibri", size=10, color="1155CC", underline="single")
@@ -101,7 +102,7 @@ def export_to_excel(output_path: str = None) -> str:
 
     # ── Автофильтр ──
     if docs:
-        ws.auto_filter.ref = f"A3:G{len(docs) + 3}"
+        ws.auto_filter.ref = f"A3:H{len(docs) + 3}"
 
     wb.save(output_path)
     return output_path

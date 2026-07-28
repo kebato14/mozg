@@ -8,7 +8,9 @@ import logging
 import re
 import tempfile
 import threading
-from datetime import datetime
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, date, time, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 from dotenv import load_dotenv
@@ -18,6 +20,21 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 import registry
+from iiko_client import IikoClient
+import price_store
+
+_executor = ThreadPoolExecutor(max_workers=4)
+
+# ─── Категории документов ────────────────────────────────────────────────────
+# code → (название для реестра, название папки в Google Drive)
+DOC_CATEGORIES = {
+    "letters":   ("📨 Служебные письма", "Служебные письма"),
+    "contracts": ("📑 Договоры", "Договоры"),
+    "advance":   ("💵 Авансовые отчёты", "Авансовые отчёты"),
+}
+
+# Ожидающие выбора категории фото: {user_id: {file_id, ext, mimetype, caption}}
+_pending_photos = {}
 
 load_dotenv()
 
@@ -32,6 +49,26 @@ YOUGILE_BASE = "https://ru.yougile.com/api-v2"
 HEADERS = {
     "Authorization": f"Bearer {YOUGILE_API_KEY}",
     "Content-Type": "application/json"
+}
+
+IIKO_SERVER_URL = os.getenv("IIKO_SERVER_URL")
+IIKO_LOGIN = os.getenv("IIKO_LOGIN")
+IIKO_PASSWORD = os.getenv("IIKO_PASSWORD")
+IIKO_CHECK_TIME = os.getenv("IIKO_CHECK_TIME", "09:00")
+IIKO_CHAT_ID = os.getenv("IIKO_CHAT_ID")
+# Порог значимого изменения цены (%). Меньшие колебания игнорируются как шум.
+IIKO_MIN_PCT = float(os.getenv("IIKO_MIN_PCT", "1"))
+
+# Настраиваемый отчёт «Ликвидность» (сохранён в iiko). Рассылается по расписанию.
+IIKO_LIQUIDITY_REPORT = os.getenv("IIKO_LIQUIDITY_REPORT", "Отчот ликвидность Чамшед Гуляев")
+IIKO_LIQUIDITY_TIME = os.getenv("IIKO_LIQUIDITY_TIME", IIKO_CHECK_TIME)  # ЧЧ:ММ, по понедельникам
+IIKO_LIQUIDITY_TOP = int(os.getenv("IIKO_LIQUIDITY_TOP", "30"))         # сколько товаров в сводке
+
+# Склады-получатели для отчёта входных (приходных) цен (GUID → название)
+IIKO_INCOMING_STORES = {
+    "ba144d03-0377-4c40-9bd8-2386aa2a6750": "Центральный склад",
+    "a0a1832d-5214-4a64-909e-6e0505c10d10": "Цех заготовок",
+    "e5733dc0-4089-4ed1-bfd8-4e972b79b60d": "Цех кондитерки",
 }
 
 logging.basicConfig(
@@ -145,6 +182,306 @@ def create_yougile_task(fields: dict) -> dict:
 
     resp = requests.post(f"{YOUGILE_BASE}/tasks", headers=HEADERS, json=payload)
     return resp.json()
+
+
+# ─── Цены закупки iiko ───────────────────────────────────────────────────────
+
+def format_price_change_message(change: dict) -> str:
+    arrow = "📈" if change["delta"] > 0 else "📉"
+    return (
+        f"{arrow} *{change['product']}*\n"
+        f"Старая цена: {change['old_price']:.2f}\n"
+        f"Новая цена: {change['new_price']:.2f}\n"
+        f"Изменение: {change['delta']:+.2f} ({change['pct']:+.1f}%)\n"
+        f"Дата: {change['date']}"
+    )
+
+
+def check_iiko_price_changes() -> list[dict]:
+    """Забирает свежие цены закупки из iiko, сравнивает со снимком, обновляет снимок."""
+    client = IikoClient(IIKO_SERVER_URL, IIKO_LOGIN, IIKO_PASSWORD)
+    try:
+        client.authenticate()
+        date_from = (date.today() - timedelta(days=1)).isoformat()
+        date_to = date.today().isoformat()
+        rows = client.get_incoming_prices(date_from, date_to)
+    finally:
+        client.logout()
+
+    snapshot = price_store.load_snapshot()
+    changes = []
+
+    for row in rows:
+        product = row["product"]
+        new_price = row["price"]
+        entry = {"price": new_price, "date": row["date"]}
+        known = snapshot.get(product)
+
+        if known is None:
+            snapshot[product] = entry
+            continue
+
+        old_price = known["price"]
+        delta = new_price - old_price
+        pct = (delta / old_price * 100) if old_price else 0.0
+
+        # Значимое изменение — обновляем базу и уведомляем.
+        # Микроколебания ниже порога считаем шумом: базу не двигаем,
+        # чтобы медленный дрейф в итоге накопился и сработал разом.
+        if abs(pct) >= IIKO_MIN_PCT:
+            changes.append({
+                "product": product,
+                "old_price": old_price,
+                "new_price": new_price,
+                "delta": delta,
+                "pct": pct,
+                "date": row["date"],
+            })
+            snapshot[product] = entry
+
+    price_store.save_snapshot(snapshot)
+    return changes
+
+
+async def iiko_scheduled_check(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        changes = check_iiko_price_changes()
+    except Exception as e:
+        logger.error(f"Ошибка проверки цен iiko: {e}")
+        return
+
+    chat_id = IIKO_CHAT_ID
+    if not chat_id:
+        logger.warning("IIKO_CHAT_ID не задан — уведомления о ценах некуда слать")
+        return
+
+    for change in changes:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=format_price_change_message(change),
+            parse_mode="Markdown",
+        )
+    logger.info(f"Проверка цен iiko завершена: {len(changes)} изменени(й)")
+
+
+async def iiko_check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Проверяю закупочные цены в iiko...")
+    try:
+        changes = check_iiko_price_changes()
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+
+    if not changes:
+        await update.message.reply_text("✅ Изменений закупочных цен не найдено.")
+        return
+
+    for change in changes:
+        await update.message.reply_text(format_price_change_message(change), parse_mode="Markdown")
+
+
+# ─── Настраиваемый отчёт «Ликвидность» ───────────────────────────────────────
+
+def _fmt_qty(v: float) -> str:
+    return f"{v:,.0f}".replace(",", " ") if abs(v) >= 100 else f"{v:.1f}"
+
+
+def build_liquidity_report(date_from: str, date_to: str) -> str:
+    """Формирует текстовую сводку по отчёту «Ликвидность» за период."""
+    client = IikoClient(IIKO_SERVER_URL, IIKO_LOGIN, IIKO_PASSWORD)
+    try:
+        client.authenticate()
+        rows = client.run_olap_preset(IIKO_LIQUIDITY_REPORT, date_from, date_to)
+    finally:
+        client.logout()
+
+    # Суммируем по товару (в отчёте строки разбиты по складам)
+    agg = {}
+    for r in rows:
+        name = r.get("Product.Name") or "—"
+        a = agg.setdefault(name, {"start": 0.0, "in": 0.0, "out": 0.0, "final": 0.0})
+        a["start"] += float(r.get("StartBalance.Amount") or 0)
+        a["in"] += float(r.get("Amount.In") or 0)
+        a["out"] += float(r.get("Amount.Out") or 0)
+        a["final"] += float(r.get("FinalBalance.Amount") or 0)
+
+    if not agg:
+        return f"📊 *Ликвидность* ({date_from}…{date_to})\n\nНет данных за период."
+
+    # Сортируем по остатку (сколько «лежит») — самые неликвидные сверху
+    items = sorted(agg.items(), key=lambda kv: kv[1]["final"], reverse=True)
+    top = items[:IIKO_LIQUIDITY_TOP]
+
+    lines = [
+        f"📊 *Ликвидность* ({date_from}…{date_to})",
+        f"_ТОП-{len(top)} по остатку из {len(items)} товаров · приход/расход/остаток_",
+        "",
+    ]
+    for name, a in top:
+        lines.append(
+            f"• *{name}*\n"
+            f"  📥 {_fmt_qty(a['in'])}  📤 {_fmt_qty(a['out'])}  📦 {_fmt_qty(a['final'])}"
+        )
+    return "\n".join(lines)
+
+
+async def liquidity_report_scheduled(context: ContextTypes.DEFAULT_TYPE):
+    # run_daily запускается ежедневно; шлём только по понедельникам
+    if date.today().weekday() != 0:
+        return
+    if not IIKO_CHAT_ID:
+        logger.warning("IIKO_CHAT_ID не задан — отчёт «Ликвидность» слать некуда")
+        return
+    date_from = (date.today() - timedelta(days=7)).isoformat()
+    date_to = (date.today() - timedelta(days=1)).isoformat()
+    try:
+        text = build_liquidity_report(date_from, date_to)
+    except Exception as e:
+        logger.error(f"Ошибка отчёта «Ликвидность»: {e}")
+        return
+    await context.bot.send_message(chat_id=IIKO_CHAT_ID, text=text, parse_mode="Markdown")
+    logger.info("Отчёт «Ликвидность» отправлен")
+
+
+async def liquidity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Формирую отчёт «Ликвидность» за прошлую неделю...")
+    date_from = (date.today() - timedelta(days=7)).isoformat()
+    date_to = (date.today() - timedelta(days=1)).isoformat()
+    try:
+        text = build_liquidity_report(date_from, date_to)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+# ─── Входные (приходные) цены по складам ─────────────────────────────────────
+
+async def _send_chunked(message, header: str, lines: list, chunk_chars: int = 3500):
+    """Шлёт header + строки, разбивая на несколько сообщений под лимит Telegram."""
+    buf = header
+    for ln in lines:
+        if len(buf) + len(ln) + 1 > chunk_chars:
+            await message.reply_text(buf, parse_mode="Markdown")
+            buf = ""
+        buf += ("\n" if buf else "") + ln
+    if buf:
+        await message.reply_text(buf, parse_mode="Markdown")
+
+
+async def incoming_prices_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not IIKO_SERVER_URL:
+        await update.message.reply_text("iiko не настроен.")
+        return
+    await update.message.reply_text("⏳ Собираю входные цены по складам за текущий месяц...")
+
+    date_from = date.today().replace(day=1).isoformat()
+    date_to = date.today().isoformat()
+    client = IikoClient(IIKO_SERVER_URL, IIKO_LOGIN, IIKO_PASSWORD)
+    try:
+        client.authenticate()
+        rows = client.incoming_prices_by_store(date_from, date_to, set(IIKO_INCOMING_STORES))
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+    finally:
+        client.logout()
+
+    by_store = {}
+    for r in rows:
+        by_store.setdefault(r["store_id"], []).append(r)
+
+    for sid, label in IIKO_INCOMING_STORES.items():
+        items = sorted(by_store.get(sid, []), key=lambda r: r["product"])
+        header = f"🏬 *{label}* — входные цены ({date_from}…{date_to})\nТоваров: {len(items)}\n"
+        if not items:
+            await update.message.reply_text(header + "\nНет оприходований за период.", parse_mode="Markdown")
+            continue
+        lines = [f"• {r['product']}: *{r['price']:.2f}*" for r in items]
+        await _send_chunked(update.message, header, lines)
+
+
+# ─── Изменение входных цен по складам (было → стало) ─────────────────────────
+
+IIKO_INCOMING_SNAPSHOT = "incoming_prices_snapshot.json"
+
+
+def check_incoming_price_changes(date_from: str, date_to: str) -> dict:
+    """Сверяет входные цены по 3 складам со снимком. Возвращает {store_id: [(product, old, new, pct)]}."""
+    client = IikoClient(IIKO_SERVER_URL, IIKO_LOGIN, IIKO_PASSWORD)
+    try:
+        client.authenticate()
+        rows = client.incoming_prices_by_store(date_from, date_to, set(IIKO_INCOMING_STORES))
+    finally:
+        client.logout()
+
+    snap = price_store.load(IIKO_INCOMING_SNAPSHOT)
+    changes = {}
+    for r in rows:
+        key = f"{r['store_id']}|{r['product']}"
+        new_price = r["price"]
+        known = snap.get(key)
+        if known is None:
+            snap[key] = {"price": new_price, "date": r["date"]}
+            continue
+        old_price = known["price"]
+        if old_price == new_price:
+            continue
+        pct = (new_price - old_price) / old_price * 100 if old_price else 0.0
+        if abs(pct) >= IIKO_MIN_PCT:
+            changes.setdefault(r["store_id"], []).append((r["product"], old_price, new_price, pct))
+            snap[key] = {"price": new_price, "date": r["date"]}
+
+    price_store.save(IIKO_INCOMING_SNAPSHOT, snap)
+    return changes
+
+
+def format_incoming_changes(store_label: str, items: list) -> str:
+    lines = [f"💱 *Изменение входных цен* — {store_label}", ""]
+    for product, old, new, pct in sorted(items, key=lambda x: abs(x[3]), reverse=True):
+        arrow = "🔺" if new > old else "🔻"
+        lines.append(f"{arrow} {product}: было {old:.2f} → стало *{new:.2f}* ({pct:+.1f}%)")
+    return "\n".join(lines)
+
+
+async def incoming_price_changes_scheduled(context: ContextTypes.DEFAULT_TYPE):
+    if not IIKO_CHAT_ID:
+        logger.warning("IIKO_CHAT_ID не задан — изменения входных цен слать некуда")
+        return
+    date_from = (date.today() - timedelta(days=2)).isoformat()
+    date_to = date.today().isoformat()
+    try:
+        changes = check_incoming_price_changes(date_from, date_to)
+    except Exception as e:
+        logger.error(f"Ошибка проверки входных цен: {e}")
+        return
+    total = 0
+    for sid, label in IIKO_INCOMING_STORES.items():
+        items = changes.get(sid)
+        if items:
+            total += len(items)
+            await context.bot.send_message(
+                chat_id=IIKO_CHAT_ID, text=format_incoming_changes(label, items), parse_mode="Markdown"
+            )
+    logger.info(f"Проверка входных цен: {total} изменени(й)")
+
+
+async def incoming_changes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("⏳ Проверяю изменения входных цен по складам...")
+    date_from = (date.today() - timedelta(days=7)).isoformat()
+    date_to = date.today().isoformat()
+    try:
+        changes = check_incoming_price_changes(date_from, date_to)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка: {e}")
+        return
+    if not any(changes.values()):
+        await update.message.reply_text("✅ Изменений входных цен не найдено.")
+        return
+    for sid, label in IIKO_INCOMING_STORES.items():
+        items = changes.get(sid)
+        if items:
+            await update.message.reply_text(format_incoming_changes(label, items), parse_mode="Markdown")
 
 
 # ─── Обработчики ────────────────────────────────────────────────────────────
@@ -350,44 +687,92 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Реестр документов ───────────────────────────────────────────────────────
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принимает фото/документ, регистрирует в реестре, хранит в Telegram"""
+    """Принимает фото/документ и спрашивает категорию перед загрузкой."""
     user = update.effective_user
     msg = update.message
 
+    # Определяем тип файла
+    if msg.photo:
+        ext = "jpg"
+        file_id = msg.photo[-1].file_id
+        mimetype = "image/jpeg"
+    elif msg.document:
+        ext = (msg.document.file_name or "file").split(".")[-1]
+        file_id = msg.document.file_id
+        mimetype = msg.document.mime_type or "application/octet-stream"
+    else:
+        await msg.reply_text("❌ Поддерживаются только фото и документы.")
+        return
+
+    # Запоминаем файл до выбора категории
+    _pending_photos[user.id] = {
+        "file_id": file_id,
+        "ext": ext,
+        "mimetype": mimetype,
+        "caption": msg.caption or "",
+    }
+
+    keyboard = [
+        [InlineKeyboardButton(label, callback_data=f"cat_{code}")]
+        for code, (label, _) in DOC_CATEGORIES.items()
+    ]
+
+    await msg.reply_text(
+        "📎 *Документ получен.*\n\nВыберите направление, к которому он относится 👇",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+
+async def handle_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """После выбора категории — загружает файл в соответствующую папку Drive."""
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+
+    code = query.data.replace("cat_", "")
+    if code not in DOC_CATEGORIES:
+        await query.edit_message_text("❌ Неизвестная категория.")
+        return
+
+    label, folder_name = DOC_CATEGORIES[code]
+
+    pending = _pending_photos.get(user.id)
+    if not pending:
+        await query.edit_message_text(
+            "⚠️ Файл не найден — отправьте документ заново."
+        )
+        return
+
+    ext = pending["ext"]
+    mimetype = pending["mimetype"]
+    caption = pending["caption"]
+
     try:
-        # Определяем тип файла
-        if msg.photo:
-            file_obj = await msg.photo[-1].get_file()
-            ext = "jpg"
-            file_id = msg.photo[-1].file_id
-            mimetype = "image/jpeg"
-        elif msg.document:
-            file_obj = await msg.document.get_file()
-            ext = (msg.document.file_name or "file").split(".")[-1]
-            file_id = msg.document.file_id
-            mimetype = msg.document.mime_type or "application/octet-stream"
-        else:
-            await msg.reply_text("❌ Поддерживаются только фото и документы.")
-            return
+        await query.edit_message_text(f"⏳ Загружаю в «{label}»...")
+
+        # Получаем файл из Telegram по file_id
+        file_obj = await context.bot.get_file(pending["file_id"])
 
         # Генерируем номер документа
         doc_number = registry.next_doc_number()
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{doc_number}_{timestamp}.{ext}"
 
-        await msg.reply_text("⏳ Загружаю в Google Drive...")
-
         # Скачиваем во временный файл
         with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
             tmp_path = tmp.name
         await file_obj.download_to_drive(tmp_path)
 
-        # Загружаем в Google Drive
+        # Загружаем в папку категории (фоновый поток)
         from gdrive import upload_file
-        result = upload_file(tmp_path, filename, mimetype)
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            _executor, upload_file, tmp_path, filename, mimetype, folder_name
+        )
         os.unlink(tmp_path)
 
-        # Сохраняем в реестр
+        # Сохраняем в реестр с категорией
         full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
         registry.save_document(
             doc_number=doc_number,
@@ -396,22 +781,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             drive_url=result["url"],
             user_id=user.id,
             username=user.username or "",
-            full_name=full_name
+            full_name=full_name,
+            category=label,
         )
 
-        caption = msg.caption or ""
+        _pending_photos.pop(user.id, None)
+
         keyboard = [
             [InlineKeyboardButton("📂 Открыть в Drive", url=result["url"])],
-            [InlineKeyboardButton("🔍 Найти", callback_data="search_docs"),
-             InlineKeyboardButton("📋 Реестр", callback_data="docs_recent")]
+            [InlineKeyboardButton("📋 Реестр", callback_data="docs_recent")]
         ]
 
-        await msg.reply_text(
-            f"✅ *Документ загружен в Google Drive*\n\n"
+        await query.edit_message_text(
+            f"✅ *Документ загружен*\n\n"
+            f"🗂 Направление: {label}\n"
             f"📄 Номер: `{doc_number}`\n"
             f"📅 Дата: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n"
             f"👤 Кто: {full_name or user.username or str(user.id)}\n"
-            f"🗂 Файл: {filename}\n"
+            f"📎 Файл: {filename}\n"
             + (f"💬 {caption}\n" if caption else ""),
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
@@ -419,7 +806,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Ошибка регистрации документа: {e}")
-        await msg.reply_text(f"❌ Ошибка: {e}")
+        await query.edit_message_text(f"❌ Ошибка: {e}")
 
 
 async def docs_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -431,13 +818,17 @@ async def docs_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Используйте:\n"
             "`/find УЦЦП-2026-0001` — по номеру\n"
             "`/find 24.06.2026` — по дате\n"
-            "`/find Алишер` — по пользователю",
+            "`/find Алишер` — по пользователю\n"
+            "`/find договоры` — по направлению",
             parse_mode="Markdown"
         )
         return
 
     query = " ".join(args)
     results = []
+
+    # Названия категорий для распознавания поиска по направлению
+    category_names = [folder.lower() for _, folder in DOC_CATEGORIES.values()]
 
     # Определяем тип поиска
     if re.match(r"\d{1,2}\.\d{2}\.\d{4}", query):
@@ -446,6 +837,9 @@ async def docs_search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif "УЦЦП" in query.upper() or re.match(r"\d{4}", query):
         results = registry.search_by_number(query)
         search_type = "номеру"
+    elif any(query.lower() in c or c in query.lower() for c in category_names):
+        results = registry.search_by_category(query)
+        search_type = "направлению"
     else:
         results = registry.search_by_user(query)
         search_type = "пользователю"
@@ -520,8 +914,10 @@ async def show_recent_docs(message):
 
     text = f"📂 *Реестр документов УЦЦП*\n_Всего: {stats['total']} | Сегодня: {stats['today']}_\n\n"
     for doc in docs:
+        cat = doc["category"] if "category" in doc.keys() and doc["category"] else "—"
         text += (
             f"📄 `{doc['doc_number']}` — {doc['uploaded_at'][:10]}\n"
+            f"🗂 {cat}\n"
             f"👤 {doc['full_name'] or doc['username']}\n\n"
         )
 
@@ -575,10 +971,24 @@ def main():
     app.add_handler(CommandHandler("find", docs_search_cmd))
     app.add_handler(CommandHandler("docs", docs_recent_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
+    app.add_handler(CommandHandler("iiko_check", iiko_check_command))
+    app.add_handler(CommandHandler("likvidnost", liquidity_command))
+    app.add_handler(CommandHandler("vhodnye", incoming_prices_command))
+    app.add_handler(CommandHandler("vhodnye_izm", incoming_changes_command))
     app.add_handler(CallbackQueryHandler(handle_confirm, pattern="^confirm_"))
+    app.add_handler(CallbackQueryHandler(handle_category, pattern="^cat_"))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.ALL, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    if IIKO_SERVER_URL:
+        hour, minute = (int(p) for p in IIKO_CHECK_TIME.split(":"))
+        app.job_queue.run_daily(iiko_scheduled_check, time=time(hour=hour, minute=minute))
+
+        lh, lm = (int(p) for p in IIKO_LIQUIDITY_TIME.split(":"))
+        app.job_queue.run_daily(liquidity_report_scheduled, time=time(hour=lh, minute=lm))
+
+        app.job_queue.run_daily(incoming_price_changes_scheduled, time=time(hour=hour, minute=minute))
 
     # Запускаем health check в фоне
     threading.Thread(target=start_health_server, daemon=True).start()

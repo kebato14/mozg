@@ -28,9 +28,14 @@ def init_db():
                 user_id     INTEGER NOT NULL,
                 username    TEXT,
                 full_name   TEXT,
+                category    TEXT,
                 uploaded_at TEXT NOT NULL
             )
         """)
+        # Миграция: добавляем category в существующую БД
+        cols = [r["name"] for r in conn.execute("PRAGMA table_info(documents)").fetchall()]
+        if "category" not in cols:
+            conn.execute("ALTER TABLE documents ADD COLUMN category TEXT")
         conn.commit()
 
 
@@ -45,13 +50,13 @@ def next_doc_number() -> str:
     return f"УЦЦП-{year}-{num:04d}"
 
 
-def save_document(doc_number, filename, drive_id, drive_url, user_id, username, full_name) -> int:
+def save_document(doc_number, filename, drive_id, drive_url, user_id, username, full_name, category=None) -> int:
     uploaded_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_conn() as conn:
         cur = conn.execute("""
-            INSERT INTO documents (doc_number, filename, drive_id, drive_url, user_id, username, full_name, uploaded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (doc_number, filename, drive_id, drive_url, user_id, username, full_name, uploaded_at))
+            INSERT INTO documents (doc_number, filename, drive_id, drive_url, user_id, username, full_name, category, uploaded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (doc_number, filename, drive_id, drive_url, user_id, username, full_name, category, uploaded_at))
         conn.commit()
         return cur.lastrowid
 
@@ -83,6 +88,15 @@ def search_by_user(query: str) -> list:
         rows = conn.execute(
             "SELECT * FROM documents WHERE username LIKE ? OR full_name LIKE ? ORDER BY uploaded_at DESC LIMIT 10",
             (f"%{query}%", f"%{query}%")
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def search_by_category(query: str) -> list:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM documents WHERE category LIKE ? ORDER BY uploaded_at DESC LIMIT 10",
+            (f"%{query}%",)
         ).fetchall()
     return [dict(r) for r in rows]
 
